@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,6 +37,7 @@ import (
 	"github.com/elastic/go-elasticsearch/v9"
 	"github.com/elastic/go-elasticsearch/v9/typedapi/core/bulk"
 	"github.com/elastic/go-elasticsearch/v9/typedapi/types"
+	"github.com/elastic/go-elasticsearch/v9/typedapi/types/enums/versiontype"
 
 	"github.com/redpanda-data/benthos/v4/public/service"
 )
@@ -48,6 +50,7 @@ const (
 	esFieldPipeline        = "pipeline"
 	esFieldRouting         = "routing"
 	esFieldRetryOnConflict = "retry_on_conflict"
+	esFieldVersion         = "version"
 	esFieldTLS             = "tls"
 	esFieldAuth            = "basic_auth"
 	esFieldAuthEnabled     = "enabled"
@@ -66,6 +69,9 @@ type esConfig struct {
 	pipeline        *service.InterpolatedString
 	routing         *service.InterpolatedString
 	retryOnConflict int
+
+	// version is nil unless external versioning is configured.
+	version *service.InterpolatedString
 }
 
 func esConfigFromParsed(pConf *service.ParsedConfig) (*esConfig, error) {
@@ -133,6 +139,18 @@ func esConfigFromParsed(pConf *service.ParsedConfig) (*esConfig, error) {
 		return nil, err
 	}
 
+	// FieldString returns the raw literal of an interpolated field, so an empty
+	// literal means version was left unset and external versioning stays off.
+	rawVersion, err := pConf.FieldString(esFieldVersion)
+	if err != nil {
+		return nil, err
+	}
+	if rawVersion != "" {
+		if conf.version, err = pConf.FieldInterpolatedString(esFieldVersion); err != nil {
+			return nil, err
+		}
+	}
+
 	return conf, nil
 }
 
@@ -167,6 +185,11 @@ Both the `+"`id` and `index`"+` fields can be dynamically set using function int
 				Description("Specify how many times should an update operation be retried when a conflict occurs").
 				Advanced().
 				Default(0),
+			service.NewInterpolatedStringField(esFieldVersion).
+				Description("An optional external version for the document. When set, the write uses Elasticsearch's `external` version type and is applied only if this version is strictly greater than the version already stored for the `id`; otherwise the conflict is treated as a successful no-op, which makes indexing idempotent and order-independent for at-least-once sources. Must resolve to a base-10 integer that fits in an `int64`, and applies only to the `index`, `upsert` and `delete` actions. See the `Idempotent, ordered indexing with external versioning` example.").
+				Example(`${! json("version") }`).
+				Advanced().
+				Default(""),
 			service.NewTLSToggledField(esFieldTLS),
 			service.NewOutputMaxInFlightField(),
 			service.NewStringField(esFieldAPIKey).
@@ -291,6 +314,32 @@ output:
     index: foo
     id: ${! @id }
     action: upsert
+`).
+		Example(
+			"Idempotent, ordered indexing with external versioning",
+			`Set `+"`version`"+` to make writes idempotent and order-independent when the same document `+"`id`"+` is written repeatedly from an at-least-once source. Here each record carries a monotonic version (for example a source timestamp, CDC log position, or sequence number), and Elasticsearch only applies a write whose version is strictly greater than the one already stored — so an out-of-order or replayed message is a no-op (a `+"`409`"+` conflict that this output treats as success) rather than a regression to stale state.
+
+Known limitations: external versioning applies to the `+"`index`, `upsert` and `delete`"+` actions. Elasticsearch does not accept external versions on `+"`create`"+` or `+"`update`"+`, so those are rejected when a `+"`version`"+` is set. Each message must resolve `+"`version`"+` to a base-10 integer that fits in an `+"`int64`"+`.`,
+			`
+input:
+  redpanda:
+    seed_brokers: [localhost:19092]
+    topics: ["entities"]
+    consumer_group: "es-projection"
+  processors:
+    - mapping: |
+        meta id = this.id
+        # A per-key monotonic version from the source. Any base-10 integer that
+        # increases with each newer revision works (timestamp, LSN, offset, ...).
+        meta version = this.updated_at_unix_ms
+        root = this
+output:
+  elasticsearch_v9:
+    urls: ['http://localhost:9200']
+    index: "entities"
+    action: "index"
+    id: ${! meta("id") }
+    version: ${! meta("version") }
 `)
 }
 
@@ -362,10 +411,15 @@ func (e *esOutput) WriteBatch(ctx context.Context, batch service.MessageBatch) e
 	bulkWriter := e.client.Bulk()
 	batchInterpolator := e.newBatchInterpolator(batch)
 
+	// versioned[i] marks ops carrying an external version, indexed by batch
+	// position to match result.Items order, so a 409 on one can be a no-op below.
+	versioned := make([]bool, len(batch))
 	for i := range batch {
-		if err := e.addOpToBatch(bulkWriter, batch, batchInterpolator, i); err != nil {
+		isVersioned, err := e.addOpToBatch(bulkWriter, batch, batchInterpolator, i)
+		if err != nil {
 			return fmt.Errorf("adding operation to batch: %w", err)
 		}
+		versioned[i] = isVersioned
 	}
 
 	result, err := bulkWriter.Do(ctx)
@@ -377,16 +431,26 @@ func (e *esOutput) WriteBatch(ctx context.Context, batch service.MessageBatch) e
 		var batchErr *service.BatchError
 		for i, item := range result.Items {
 			for _, responseItem := range item {
-				if responseItem.Error != nil {
-					err := errors.New(*responseItem.Error.Reason)
-					if batchErr == nil {
-						batchErr = service.NewBatchError(batch, err)
-					}
-					batchErr.Failed(i, err)
+				if responseItem.Error == nil {
+					continue
 				}
+				// A 409 on an externally-versioned op is expected (a newer or equal
+				// version already exists), so treat it as a no-op. A 409 on any
+				// other op keeps its usual meaning.
+				if responseItem.Status == http.StatusConflict && i < len(versioned) && versioned[i] {
+					e.log.Debugf("Skipping externally versioned document at batch index %d: a newer or equal version already exists (409 conflict)", i)
+					continue
+				}
+				err := errors.New(*responseItem.Error.Reason)
+				if batchErr == nil {
+					batchErr = service.NewBatchError(batch, err)
+				}
+				batchErr.Failed(i, err)
 			}
 		}
-		return batchErr
+		if batchErr != nil {
+			return batchErr
+		}
 	}
 
 	// result.Took is an int64 counting milliseconds
@@ -403,13 +467,17 @@ func (e *esOutput) WriteBatch(ctx context.Context, batch service.MessageBatch) e
 }
 
 func (e *esOutput) newBatchInterpolator(batch service.MessageBatch) *batchInterpolator {
-	return &batchInterpolator{
+	bi := &batchInterpolator{
 		action:   batch.InterpolationExecutor(e.conf.action),
 		index:    batch.InterpolationExecutor(e.conf.index),
 		routing:  batch.InterpolationExecutor(e.conf.routing),
 		id:       batch.InterpolationExecutor(e.conf.id),
 		pipeline: batch.InterpolationExecutor(e.conf.pipeline),
 	}
+	if e.conf.version != nil {
+		bi.version = batch.InterpolationExecutor(e.conf.version)
+	}
+	return bi
 }
 
 type batchInterpolator struct {
@@ -418,34 +486,51 @@ type batchInterpolator struct {
 	routing  *service.MessageBatchInterpolationExecutor
 	id       *service.MessageBatchInterpolationExecutor
 	pipeline *service.MessageBatchInterpolationExecutor
+	version  *service.MessageBatchInterpolationExecutor
 }
 
-func (e *esOutput) addOpToBatch(bulkWriter *bulk.Bulk, batch service.MessageBatch, batchInterpolator *batchInterpolator, i int) error {
+// addOpToBatch appends message i's operation to the bulk request and reports
+// whether it carries an external version, so the caller can treat a later 409
+// on it as a no-op.
+func (e *esOutput) addOpToBatch(bulkWriter *bulk.Bulk, batch service.MessageBatch, batchInterpolator *batchInterpolator, i int) (bool, error) {
 	msg := batch[i]
 	msgBytes, err := msg.AsBytes()
 	if err != nil {
-		return fmt.Errorf("reading raw message data: %w", err)
+		return false, fmt.Errorf("reading raw message data: %w", err)
 	}
 
 	action, err := batchInterpolator.action.TryString(i)
 	if err != nil {
-		return fmt.Errorf("interpolating action: %w", err)
+		return false, fmt.Errorf("interpolating action: %w", err)
 	}
 	index, err := batchInterpolator.index.TryString(i)
 	if err != nil {
-		return fmt.Errorf("interpolating index: %w", err)
+		return false, fmt.Errorf("interpolating index: %w", err)
 	}
 	routing, err := batchInterpolator.routing.TryString(i)
 	if err != nil {
-		return fmt.Errorf("interpolating routing: %w", err)
+		return false, fmt.Errorf("interpolating routing: %w", err)
 	}
 	id, err := batchInterpolator.id.TryString(i)
 	if err != nil {
-		return fmt.Errorf("interpolating id: %w", err)
+		return false, fmt.Errorf("interpolating id: %w", err)
 	}
 	pipeline, err := batchInterpolator.pipeline.TryString(i)
 	if err != nil {
-		return fmt.Errorf("interpolating pipeline: %w", err)
+		return false, fmt.Errorf("interpolating pipeline: %w", err)
+	}
+	version, err := batchInterpolator.tryVersion(i)
+	if err != nil {
+		return false, err
+	}
+
+	// Elasticsearch allows an external version only on index and delete ops: it
+	// rejects create ("create operations only support internal versioning; use
+	// index instead") and update ("update requests do not support versioning").
+	// Reject both rather than send a request Elasticsearch refuses. (upsert is
+	// served as an index op.)
+	if version != nil && (action == "update" || action == "create") {
+		return false, fmt.Errorf("external versioning (the `%s` field) is not supported with the %q action; use `index` instead", esFieldVersion, action)
 	}
 
 	switch action {
@@ -456,10 +541,15 @@ func (e *esOutput) addOpToBatch(bulkWriter *bulk.Bulk, batch service.MessageBatc
 			Pipeline: optionalStr(pipeline),
 			Routing:  optionalStrSlice(routing),
 		}
+		if version != nil {
+			op.Version = version
+			op.VersionType = &externalVersionType
+		}
 		if err := bulkWriter.IndexOp(op, msgBytes); err != nil {
-			return err
+			return false, err
 		}
 	case "create":
+		// create never carries an external version (rejected above).
 		op := types.CreateOperation{
 			Index_:   &index,
 			Id_:      optionalStr(id),
@@ -467,7 +557,7 @@ func (e *esOutput) addOpToBatch(bulkWriter *bulk.Bulk, batch service.MessageBatc
 			Routing:  optionalStrSlice(routing),
 		}
 		if err := bulkWriter.CreateOp(op, msgBytes); err != nil {
-			return err
+			return false, err
 		}
 	case "update":
 		op := types.UpdateOperation{
@@ -482,7 +572,7 @@ func (e *esOutput) addOpToBatch(bulkWriter *bulk.Bulk, batch service.MessageBatc
 		// not, other fields that may alter behavior we depend on internally.
 		var update updateAction
 		if err := json.Unmarshal(msgBytes, &update); err != nil {
-			return fmt.Errorf("unmarshalling update action: %w", err)
+			return false, fmt.Errorf("unmarshalling update action: %w", err)
 		}
 		err := bulkWriter.UpdateOp(op, nil, &types.UpdateAction{
 			Doc:    update.Doc,
@@ -490,7 +580,7 @@ func (e *esOutput) addOpToBatch(bulkWriter *bulk.Bulk, batch service.MessageBatc
 			Upsert: update.Upsert,
 		})
 		if err != nil {
-			return err
+			return false, err
 		}
 	case "delete":
 		op := types.DeleteOperation{
@@ -498,11 +588,34 @@ func (e *esOutput) addOpToBatch(bulkWriter *bulk.Bulk, batch service.MessageBatc
 			Index_:  &index,
 			Routing: optionalStrSlice(routing),
 		}
+		if version != nil {
+			op.Version = version
+			op.VersionType = &externalVersionType
+		}
 		if err := bulkWriter.DeleteOp(op); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return nil
+	return version != nil, nil
+}
+
+// tryVersion resolves message i's external version, or nil if versioning is off.
+func (b *batchInterpolator) tryVersion(i int) (*int64, error) {
+	if b.version == nil {
+		return nil, nil
+	}
+	versionStr, err := b.version.TryString(i)
+	if err != nil {
+		return nil, fmt.Errorf("interpolating version: %w", err)
+	}
+	if versionStr == "" {
+		return nil, fmt.Errorf("the `%s` field resolved to an empty string; it must resolve to a base-10 integer", esFieldVersion)
+	}
+	version, err := strconv.ParseInt(versionStr, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("parsing the `%s` field value %q as an int64: %w", esFieldVersion, versionStr, err)
+	}
+	return &version, nil
 }
 
 type updateAction struct {
@@ -510,6 +623,8 @@ type updateAction struct {
 	Script *types.Script   `json:"script"`
 	Upsert json.RawMessage `json:"upsert"`
 }
+
+var externalVersionType = versiontype.External
 
 func optionalStr(s string) *string {
 	if s == "" {
